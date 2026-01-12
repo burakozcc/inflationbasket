@@ -1,0 +1,5 @@
+{
+  "name": "My Inflation Basket",
+  "description": "A personal inflation and investment tracking application allowing users to track their specific cost of living against national averages and monitor their real investment returns.",
+  "requestFramePermissions": []
+}
