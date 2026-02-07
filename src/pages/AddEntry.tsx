@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAppStore } from '../store';
+import { supabase } from '../lib/supabase';
+import { toISODate } from '../utils/date';
 import { ScreenWrapper } from '../../components/Shared';
 import { BasketItem, Investment } from '../types';
 
@@ -10,7 +12,7 @@ type EntityType = 'basket' | 'investment';
 export const AddEntryPage = () => {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
-    const { addBasketItem, updateBasketItem, addInvestment, updateInvestment, addBasketPriceEntry, addInvestmentPriceEntry, basketItems, investments, currencySymbol } = useAppStore();
+    const { addBasketItem, updateBasketItem, addInvestment, updateInvestment, addBasketPriceEntry, addInvestmentPriceEntry, basketItems, investments, currencySymbol, refetchBasket } = useAppStore();
 
     const mode = (searchParams.get('mode') as EntryMode) || 'investment';
     const relatedId = searchParams.get('relatedId');
@@ -41,6 +43,16 @@ export const AddEntryPage = () => {
         price: '',
         date: new Date().toISOString().split('T')[0]
     });
+    const [submitError, setSubmitError] = useState<string | null>(null);
+    const [debugText, setDebugText] = useState<string>('');
+
+    const pushDebug = (msg: string) => {
+        if (import.meta.env.DEV) {
+            const line = `[${new Date().toISOString().slice(11, 19)}] ${msg}`;
+            console.log(line);
+            setDebugText(prev => (prev ? prev + '\n' + line : line));
+        }
+    };
 
     // Prefill for Price Entry
     useEffect(() => {
@@ -85,8 +97,17 @@ export const AddEntryPage = () => {
         return true;
     };
 
-    const handleSubmit = () => {
-        if (!isValid()) return;
+    const handleSubmit = async () => {
+        if (import.meta.env.DEV) {
+            pushDebug('SAVE CLICKED (handleSubmit entered)');
+            pushDebug(`mode=${mode} editId=${editId ?? 'null'} relatedId=${relatedId ?? 'null'} entity=${entityType}`);
+        }
+        setSubmitError(null);
+
+        if (!isValid()) {
+            if (import.meta.env.DEV) pushDebug('INVALID FORM - submit blocked');
+            return;
+        }
 
         if (editId) {
             // --- EDIT MODE ---
@@ -103,32 +124,101 @@ export const AddEntryPage = () => {
                     quantity: parseFloat(formData.quantity)
                 });
             }
-        } else {
-            // --- ADD MODE ---
-            if (mode === 'basket_item') {
-                addBasketItem({
-                    name: formData.name,
-                    category: formData.category,
-                    price: parseFloat(formData.price),
-                    image: `https://picsum.photos/seed/${formData.name}/200`
-                });
-            } else if (mode === 'investment') {
-                addInvestment({
-                    symbol: formData.symbol.toUpperCase(),
-                    name: formData.name || formData.symbol.toUpperCase(),
-                    type: formData.type as any,
-                    quantity: parseFloat(formData.quantity),
-                    currentPrice: parseFloat(formData.price)
-                });
-            } else if (mode === 'price_entry' && relatedId) {
-                if (entityType === 'investment') {
-                    addInvestmentPriceEntry(relatedId, parseFloat(formData.price), formData.date);
-                } else {
-                    addBasketPriceEntry(relatedId, parseFloat(formData.price), formData.date);
-                }
-            }
+            navigate(-1);
+            return;
         }
 
+        if (mode === 'basket_item') {
+            // --- NEW BASKET ITEM: Save Entry (Supabase) ---
+            try {
+                const { data: { session }, error: sessErr } = await supabase.auth.getSession();
+                if (import.meta.env.DEV) pushDebug('SESSION=' + (session ? 'OK' : 'MISSING') + (sessErr ? ' err=' + sessErr.message : ''));
+                if (!session?.user?.id) throw new Error('AUTH_REQUIRED');
+                const userId = session.user.id;
+
+                const nameTrimmed = formData.name.trim();
+                const priceNumber = parseFloat(formData.price);
+                const priceDateISO = toISODate(formData.date);
+
+                if (import.meta.env.DEV) pushDebug('STEP 2: upsert basket_items');
+                const { data: existing, error: findErr } = await supabase
+                    .from('basket_items')
+                    .select('id')
+                    .eq('user_id', userId)
+                    .ilike('name', nameTrimmed)
+                    .maybeSingle();
+                if (findErr) {
+                    if (import.meta.env.DEV) pushDebug('SUPABASE_ERROR: ' + findErr.message);
+                    throw findErr;
+                }
+
+                let itemId: string;
+                if (existing) {
+                    itemId = existing.id;
+                } else {
+                    const { data: created, error: insertErr } = await supabase
+                        .from('basket_items')
+                        .insert([{ user_id: userId, name: nameTrimmed, category: formData.category }])
+                        .select('id')
+                        .single();
+                    if (insertErr) {
+                        if (import.meta.env.DEV) pushDebug('SUPABASE_ERROR: ' + insertErr.message);
+                        throw insertErr;
+                    }
+                    if (!created?.id) throw new Error('No id returned from basket_items insert');
+                    itemId = created.id;
+                }
+
+                if (import.meta.env.DEV) pushDebug('STEP 3: insert basket_price_entries');
+                const { error: priceErr } = await supabase.from('basket_price_entries').insert([{
+                    user_id: userId,
+                    basket_item_id: itemId,
+                    price: priceNumber,
+                    currency: 'TRY',
+                    price_date: priceDateISO
+                }]);
+                if (priceErr) {
+                    if (import.meta.env.DEV) console.log('[save-entry] basket_items ok, basket_price_entries failed', priceErr.message);
+                    setSubmitError('Item saved, but price could not be recorded. Please retry.');
+                    if (typeof alert !== 'undefined') alert('Item saved, but price could not be recorded. Please retry.');
+                    return;
+                }
+
+                if (import.meta.env.DEV) pushDebug('DONE');
+                console.log('[save-entry] success');
+                await refetchBasket();
+                navigate(-1);
+            } catch (e) {
+                const msg = (e as Error)?.message ?? String(e);
+                console.error('[save-entry] failed', msg);
+                if (import.meta.env.DEV) {
+                    pushDebug('ERROR: ' + msg);
+                    pushDebug('ERROR_RAW: ' + JSON.stringify(e, Object.getOwnPropertyNames(e)));
+                }
+                setSubmitError(msg);
+            } finally {
+                if (import.meta.env.DEV) console.log('handleSubmit (basket_item) finished');
+            }
+            return;
+        }
+
+        // --- ADD MODE (non-basket) ---
+        if (mode === 'investment') {
+            addInvestment({
+                symbol: formData.symbol.toUpperCase(),
+                name: formData.name || formData.symbol.toUpperCase(),
+                type: formData.type as any,
+                quantity: parseFloat(formData.quantity),
+                currentPrice: parseFloat(formData.price)
+            });
+        } else if (mode === 'price_entry' && relatedId) {
+            const dateISO = toISODate(formData.date);
+            if (entityType === 'investment') {
+                addInvestmentPriceEntry(relatedId, parseFloat(formData.price), dateISO);
+            } else {
+                addBasketPriceEntry(relatedId, parseFloat(formData.price), dateISO);
+            }
+        }
         navigate(-1);
     };
 
@@ -156,7 +246,11 @@ export const AddEntryPage = () => {
             </div>
 
             <main className="flex-1 overflow-y-auto w-full pb-32 pt-6 px-5 gap-6 flex flex-col">
-                
+                {submitError && (
+                    <div className="rounded-xl bg-red-900/20 border border-red-500/30 p-3 text-red-400 text-sm">
+                        {submitError}
+                    </div>
+                )}
                 {/* --- Asset Class / Category Selector --- */}
                 {mode === 'investment' && (
                     <div className="flex flex-col">
@@ -271,7 +365,7 @@ export const AddEntryPage = () => {
             <div className="fixed bottom-0 left-0 right-0 p-5 bg-gradient-to-t from-background-dark via-background-dark to-transparent pt-10 pb-8 pointer-events-none">
                 <div className="max-w-md mx-auto pointer-events-auto">
                     <button 
-                        onClick={handleSubmit} 
+                        onClick={() => { if (import.meta.env.DEV) pushDebug('SAVE BUTTON CLICKED'); handleSubmit(); }} 
                         disabled={!isValid()}
                         className={`w-full h-14 rounded-xl flex items-center justify-center gap-2 transition-all ${isValid() ? 'bg-primary shadow-[0_8px_20px_-4px_rgba(19,236,236,0.3)] hover:shadow-primary/40 active:scale-[0.98]' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}>
                         <span className={`text-lg font-bold tracking-wide ${isValid() ? 'text-black' : 'text-gray-500'}`}>{editId ? 'Save Changes' : 'Save Entry'}</span>
@@ -279,6 +373,30 @@ export const AddEntryPage = () => {
                     </button>
                 </div>
             </div>
+
+            {import.meta.env.DEV && (
+                <pre
+                    style={{
+                        position: 'fixed',
+                        bottom: 90,
+                        left: 12,
+                        right: 12,
+                        maxHeight: 160,
+                        overflow: 'auto',
+                        background: 'rgba(0,0,0,0.7)',
+                        border: '1px solid rgba(255,255,255,0.15)',
+                        padding: 10,
+                        fontSize: 11,
+                        zIndex: 99999,
+                        margin: 0,
+                        color: '#e5e5e5',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-all',
+                    }}
+                >
+                    {debugText || 'No debug yet'}
+                </pre>
+            )}
         </ScreenWrapper>
     );
 };

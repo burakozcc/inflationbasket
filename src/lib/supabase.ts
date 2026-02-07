@@ -1,18 +1,36 @@
+// DO NOT CREATE ANOTHER SUPABASE CLIENT — import supabase from this file only.
 import { createClient } from '@supabase/supabase-js';
+import { Preferences } from '@capacitor/preferences';
 
-// Cast import.meta to any to allow access to .env property without specific Vite types
-const env = (import.meta as any).env;
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-// Use provided URL as fallback or env var. 
-// Note: Without a valid ANON_KEY, requests will fail, but the app will initialize.
-const supabaseUrl = env?.VITE_SUPABASE_URL || 'https://qohhsadjijjgvzmsstsv.supabase.co';
-const supabaseAnonKey = env?.VITE_SUPABASE_ANON_KEY || 'placeholder-key-to-prevent-crash';
-
-if (!env?.VITE_SUPABASE_URL || !env?.VITE_SUPABASE_ANON_KEY) {
-  console.warn('Supabase credentials missing. App running with placeholders.');
+if (!supabaseUrl) {
+  throw new Error("VITE_SUPABASE_URL is missing. Check .env file and rebuild.");
 }
 
-export const supabase = createClient(
-  supabaseUrl,
-  supabaseAnonKey
-);
+if (!supabaseAnonKey) {
+  throw new Error("VITE_SUPABASE_ANON_KEY is missing. Check .env file and rebuild.");
+}
+
+const capacitorStorage = {
+  async getItem(key: string) {
+    const { value } = await Preferences.get({ key });
+    return value ?? null;
+  },
+  async setItem(key: string, value: string) {
+    await Preferences.set({ key, value });
+  },
+  async removeItem(key: string) {
+    await Preferences.remove({ key });
+  },
+};
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    storage: capacitorStorage,
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: false,
+  },
+});

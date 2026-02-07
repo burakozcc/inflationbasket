@@ -1,3 +1,6 @@
+import "./src/polyfills/cryptoRandomUUID";
+console.log("[polyfill] crypto.randomUUID available:", typeof globalThis.crypto?.randomUUID);
+
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';

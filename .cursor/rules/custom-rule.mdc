@@ -1,0 +1,157 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+❗ AI MUST FOLLOW THESE RULES
+1. ARCHITECTURE RULE
+
+This is a mobile-first, offline-first, Supabase-backed React app.
+
+AI must not change architecture style.
+All improvements must extend existing patterns.
+
+Do NOT:
+
+replace Context store with Redux
+
+introduce new state libraries
+
+create parallel data systems
+
+2. SINGLE SOURCE OF TRUTH
+
+All app data flows through:
+
+src/store.tsx
+
+
+AI must not:
+
+duplicate state in pages
+
+create local caches outside the store
+
+fetch Supabase directly from pages/components
+
+All data actions must be store actions.
+
+3. OFFLINE-FIRST PRINCIPLE
+
+This app must work without network.
+
+When modifying data logic:
+
+Update local state first (optimistic)
+
+Queue sync operation
+
+Retry background sync
+
+AI must NEVER:
+
+block UI on network response
+
+remove localStorage persistence
+
+4. SUPABASE RULES
+
+Supabase is the backend.
+
+AI must:
+
+Use only anon public key
+
+Respect RLS (auth.uid() = user_id)
+
+Never store service_role keys in frontend
+
+Keep database writes inside store sync layer
+
+5. DO NOT BREAK EXISTING FEATURES
+
+AI must preserve:
+
+AI Insights flow
+
+Price history structure
+
+Date range logic
+
+RevenueCat entitlement checks
+
+Gemini caching system
+
+When editing, AI must modify minimally.
+
+6. NO “SMART AUTO-DETECTION” PATTERNS
+
+AI must NOT introduce:
+
+❌ Generic "detect type from id" logic
+❌ Dynamic function overloading by guessing
+❌ Implicit magic behavior
+
+Use explicit functions:
+
+addBasketPriceEntry
+
+addInvestmentPriceEntry
+
+7. ANDROID LAYER IS SEPARATE
+
+AI must not modify:
+
+android/
+capacitor.config.*
+gradle files
+
+
+Unless the user explicitly asks for Android platform changes.
+
+8. PERFORMANCE RULE
+
+AI must:
+
+memoize expensive computations
+
+avoid unnecessary re-renders
+
+not introduce polling
+
+not run AI calls on every render
+
+9. ERROR HANDLING RULE
+
+All network calls must:
+
+be wrapped in try/catch
+
+never crash UI
+
+not rollback optimistic state
+
+log errors cleanly
+
+10. WHEN UNSURE
+
+AI must ask clarifying questions before major refactors.
+
+🔒 AI SAFETY DIRECTIVE
+
+This is a production-bound mobile app.
+Stability > cleverness.
+
+AI should prefer:
+✔ small edits
+✔ additive logic
+✔ wrapping existing functions
+
+AI must avoid:
+❌ rewrites
+❌ architecture swaps
+❌ “simplify by deleting”
+
+🎯 PROJECT GOAL
+
+Build a reliable, offline-capable personal inflation tracking app with Supabase sync and AI insights, suitable for Play Store production.

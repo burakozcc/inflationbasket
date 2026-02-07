@@ -2,9 +2,15 @@ import React, { createContext, useContext, useState, ReactNode, useEffect, useCa
 import { Session } from '@supabase/supabase-js';
 import { BasketItem, Investment, UserSettings, HistoricalPoint, AIState } from './types';
 import { supabase } from './lib/supabase';
+import { enqueue, processQueue, clearQueue, type SyncAction } from './lib/syncQueue';
 import { generateInsights } from './services/gemini';
 import { DateRange, getDateRangeWindow } from './lib/dateRange';
 import { calcWeightedInflation } from './lib/inflation';
+import { getInitialOnlineStatus, subscribeToNetworkChanges } from './lib/network';
+import { safeCall } from './lib/safeSupabase';
+import { mergeById } from './lib/merge';
+import { migrateBasketItems, migrateInvestments } from './lib/migrations';
+import { isValidPrice, isValidQuantity, isValidDateISO, isNotFutureDate } from './lib/validators';
 import { initRevenueCat, presentPaywall, presentCustomerCenter } from './services/revenuecat';
 
 // --- Default/Fallback Exchange Rates (Base: TRY) ---
@@ -19,12 +25,37 @@ const DEFAULT_RATES: Record<string, number> = {
 const initialBasket: BasketItem[] = []; // Empty for sync-enabled app
 const initialInvestments: Investment[] = [];
 
+const defaultSettings: UserSettings = { currency: 'TRY', theme: 'dark', compactView: false, isPremium: false };
+
+const STORAGE_VERSION = 2;
+const BASKET_KEY = `basketItems_v${STORAGE_VERSION}`;
+
+function mapBasketRowToItem(row: { id: string; name: string; category: string }): BasketItem {
+    return {
+        id: row.id,
+        name: row.name,
+        category: row.category,
+        price: 0,
+        lastUpdated: 'Synced',
+        inflationRate: 0,
+        trend: 'stable',
+        image: `https://picsum.photos/seed/${row.name}/200`,
+        history: []
+    };
+}
+const INVEST_KEY = `investments_v${STORAGE_VERSION}`;
+const SETTINGS_KEY = `settings_v${STORAGE_VERSION}`;
+
 // --- Context Setup ---
 interface AppContextType {
     session: Session | null;
     authLoading: boolean;
     authError: string | null;
-    
+    isInitializing: boolean;
+    isOnline: boolean;
+    isSyncing: boolean;
+    lastRemoteSyncISO: string | null;
+
     // Entitlements
     isPremium: boolean;
     entitlementLoading: boolean;
@@ -55,6 +86,7 @@ interface AppContextType {
     addInvestmentPriceEntry: (itemId: string, price: number, date: string) => void;
     
     updateSettings: (s: Partial<UserSettings>) => void;
+    refetchBasket: () => Promise<void>;
 
     // AI & Range
     selectedRange: DateRange;
@@ -70,6 +102,10 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
     const [session, setSession] = useState<Session | null>(null);
     const [authLoading, setAuthLoading] = useState<boolean>(false);
     const [authError, setAuthError] = useState<string | null>(null);
+    const [isInitializing, setIsInitializing] = useState<boolean>(true);
+    const [isOnline, setIsOnline] = useState(getInitialOnlineStatus());
+    const [isSyncing, setIsSyncing] = useState(false);
+    const [lastRemoteSyncISO, setLastRemoteSyncISO] = useState<string | null>(null);
 
     // Entitlement State
     const [isPremium, setIsPremium] = useState<boolean>(false);
@@ -82,59 +118,106 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
     // Exchange Rate State
     const [exchangeRates, setExchangeRates] = useState<Record<string, number>>(DEFAULT_RATES);
 
-    // Initialize state from LocalStorage
+    // Initialize state from LocalStorage (with migration)
     const [basketItems, setBasketItems] = useState<BasketItem[]>(() => {
-        const saved = localStorage.getItem('basketItems_v2');
-        return saved ? JSON.parse(saved) : initialBasket;
+        const rawBasket = localStorage.getItem(BASKET_KEY);
+        let initialBasket: BasketItem[] = [];
+        if (rawBasket) {
+            try {
+                initialBasket = migrateBasketItems(JSON.parse(rawBasket));
+            } catch {
+                initialBasket = [];
+            }
+        }
+        return initialBasket;
     });
 
     const [investments, setInvestments] = useState<Investment[]>(() => {
-        const saved = localStorage.getItem('investments_v2');
-        return saved ? JSON.parse(saved) : initialInvestments;
+        const rawInvest = localStorage.getItem(INVEST_KEY);
+        let initialInvest: Investment[] = [];
+        if (rawInvest) {
+            try {
+                initialInvest = migrateInvestments(JSON.parse(rawInvest));
+            } catch {
+                initialInvest = [];
+            }
+        }
+        return initialInvest;
     });
 
     const [settings, setSettings] = useState<UserSettings>(() => {
-        const saved = localStorage.getItem('settings_v2');
-        return saved ? JSON.parse(saved) : { currency: 'TRY', theme: 'dark', compactView: false, isPremium: false };
+        const saved = localStorage.getItem(SETTINGS_KEY);
+        return saved ? JSON.parse(saved) : defaultSettings;
     });
 
-    // --- Auth & Data Sync ---
-    useEffect(() => {
-        // Check active session
-        supabase.auth.getSession().then(({ data: { session } }) => {
-            setSession(session);
-            if (session) {
-                // Immediate clear to prevent guest data flash
-                setBasketItems([]);
-                setInvestments([]);
-                setAuthLoading(true);
-                // Initialize RevenueCat
-                initRevenueCat(session.user.id);
-                loadRemoteData(session.user.id);
-            }
-        });
+    function clearAllLocalData() {
+        setBasketItems([]);
+        setInvestments([]);
+        setSettings(defaultSettings);
+    }
 
-        const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-            setSession(session);
-            if (session) {
-                // Immediate clear to prevent guest data flash
-                setBasketItems([]);
-                setInvestments([]);
-                setAuthLoading(true);
-                // Initialize RevenueCat
-                initRevenueCat(session.user.id);
-                loadRemoteData(session.user.id);
+    // --- Remove old storage keys on first load ---
+    useEffect(() => {
+        Object.keys(localStorage)
+            .filter(k => k.startsWith('basketItems_') && k !== BASKET_KEY)
+            .forEach(k => localStorage.removeItem(k));
+        Object.keys(localStorage)
+            .filter(k => k.startsWith('investments_') && k !== INVEST_KEY)
+            .forEach(k => localStorage.removeItem(k));
+        Object.keys(localStorage)
+            .filter(k => k.startsWith('settings_') && k !== SETTINGS_KEY)
+            .forEach(k => localStorage.removeItem(k));
+    }, []);
+
+    // --- Session restore on app start ---
+    useEffect(() => {
+        const init = async () => {
+            const s = await supabase.auth.getSession();
+            console.log('[auth] initial session:', !!s.data.session);
+            const currentSession = s.data.session ?? null;
+            setSession(currentSession);
+
+            if (currentSession) {
+                initRevenueCat(currentSession.user.id);
+                await loadRemoteData(currentSession.user.id);
             } else {
-                // Logout: Clear user data to prevent leaks
-                setBasketItems([]);
-                setInvestments([]);
+                clearAllLocalData();
+            }
+
+            setIsInitializing(false);
+        };
+
+        init();
+    }, []);
+
+    // --- Auth state change (user switch / sign out) ---
+    useEffect(() => {
+        const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+            console.log('[auth] event:', event, 'hasSession:', !!session);
+            setSession(session);
+
+            if (event === 'SIGNED_OUT') {
+                clearAllLocalData();
+                clearQueue();
                 setAuthLoading(false);
                 setIsPremium(false);
                 setEntitlementLoading(false);
             }
+
+            if (event === 'SIGNED_IN' && session) {
+                clearAllLocalData();
+                setAuthLoading(true);
+                initRevenueCat(session.user.id);
+                loadRemoteData(session.user.id);
+            }
         });
 
         return () => subscription.unsubscribe();
+    }, []);
+
+    useEffect(() => {
+        const unsubscribe = subscribeToNetworkChanges(setIsOnline);
+        return unsubscribe;
     }, []);
 
     const loadRemoteData = async (userId: string) => {
@@ -156,36 +239,21 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
                 await supabase.from('user_settings').insert({ user_id: userId, currency: 'TRY' });
             }
 
-            // 2. Fetch Basket Items & History
+            // 2. Fetch Basket Items (public.basket_items: id, user_id, name, category, created_at, updated_at)
+            console.log('Fetching basket_items for user', userId);
             const { data: bData, error: bError } = await supabase
                 .from('basket_items')
-                .select('*, basket_price_entries(*)')
-                .eq('user_id', userId);
+                .select('*')
+                .eq('user_id', userId)
+                .order('created_at', { ascending: false });
 
-            if (bError) throw bError;
+            if (bError) {
+                console.error('basket_items fetch error', bError);
+                throw bError;
+            }
 
             if (bData) {
-                const mappedBasket: BasketItem[] = bData.map((row: any) => {
-                    const history = (row.basket_price_entries || [])
-                        .map((e: any) => ({ date: e.date, value: e.price }))
-                        .sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime());
-                    
-                    const lastPrice = history.length > 0 ? history[history.length - 1].value : 0;
-                    const firstPrice = history.length > 0 ? history[0].value : 0;
-                    const inflationRate = firstPrice > 0 ? parseFloat((((lastPrice - firstPrice) / firstPrice) * 100).toFixed(1)) : 0;
-
-                    return {
-                        id: row.id,
-                        name: row.name,
-                        category: row.category,
-                        price: lastPrice,
-                        lastUpdated: 'Synced',
-                        inflationRate,
-                        trend: 'stable',
-                        image: `https://picsum.photos/seed/${row.name}/200`,
-                        history
-                    };
-                });
+                const mappedBasket: BasketItem[] = bData.map((row: any) => mapBasketRowToItem(row));
                 setBasketItems(mappedBasket);
             }
 
@@ -238,13 +306,88 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
             }
 
         } catch (error: any) {
-            console.error("Sync failed", error);
+            console.error('Sync failed (basket_items/investments)', error);
             setAuthError(error.message || "Failed to load data");
         } finally {
             setAuthLoading(false);
             setEntitlementLoading(false);
         }
     };
+
+    function mapBasketWithPrices(row: any): BasketItem {
+        const entries = row.basket_price_entries || [];
+        const history = entries
+            .map((e: any) => ({ date: e.price_date, value: e.price }))
+            .sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime());
+        const lastPrice = history.length > 0 ? history[history.length - 1].value : 0;
+        const firstPrice = history.length > 0 ? history[0].value : 0;
+        const inflationRate = firstPrice > 0 ? parseFloat((((lastPrice - firstPrice) / firstPrice) * 100).toFixed(1)) : 0;
+        return {
+            id: row.id,
+            name: row.name,
+            category: row.category,
+            price: lastPrice,
+            lastUpdated: 'Synced',
+            inflationRate,
+            trend: 'stable',
+            image: `https://picsum.photos/seed/${row.name}/200`,
+            history
+        };
+    }
+
+    async function refreshRemoteData(userId: string): Promise<void> {
+        try {
+            const [basketRes, investRes] = await Promise.all([
+                supabase.from('basket_items').select('*, basket_price_entries(*)').eq('user_id', userId).order('created_at', { ascending: false }),
+                supabase.from('investments').select('*, investment_price_entries(*)').eq('user_id', userId),
+            ]);
+
+            if (!basketRes.error && basketRes.data) {
+                const mappedBasket = basketRes.data.map((row: any) => mapBasketWithPrices(row));
+                setBasketItems(prev => mergeById(prev, mappedBasket));
+            }
+
+            if (!investRes.error && investRes.data) {
+                const mappedInv = investRes.data.map((row: any) => {
+                    const history = (row.investment_price_entries || [])
+                        .map((e: any) => ({ date: e.date, value: e.price }))
+                        .sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime());
+                    const currentPrice = history.length > 0 ? history[history.length - 1].value : 0;
+                    const typeFormatted = row.type ? (row.type.charAt(0).toUpperCase() + row.type.slice(1)) : 'Stock';
+                    return {
+                        id: row.id,
+                        name: row.name,
+                        symbol: row.symbol,
+                        type: typeFormatted as Investment['type'],
+                        quantity: row.quantity,
+                        currentPrice,
+                        dayChangePct: 0,
+                        history,
+                        updated_at: row.updated_at,
+                    };
+                });
+                setInvestments(prev => mergeById(prev, mappedInv));
+            }
+
+            setLastRemoteSyncISO(new Date().toISOString());
+        } catch (e) {
+            console.warn('refreshRemoteData failed', e);
+        }
+    }
+
+    const refetchBasket = useCallback(async () => {
+        if (!session) return;
+        const { data, error } = await supabase
+            .from('basket_items')
+            .select('*, basket_price_entries(*)')
+            .eq('user_id', session.user.id)
+            .order('created_at', { ascending: false });
+        if (error) {
+            console.error('refetchBasket failed', error);
+            return;
+        }
+        if (data) setBasketItems(data.map((row: any) => mapBasketWithPrices(row)));
+    }, [session]);
 
     // --- Exchange Rates ---
     useEffect(() => {
@@ -265,10 +408,88 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
         return () => clearInterval(interval);
     }, []);
 
+    async function runSyncAction(action: SyncAction): Promise<void> {
+        let res: { data?: any; error?: unknown };
+        switch (action.type) {
+            case 'ADD_BASKET_ITEM':
+                res = await safeCall(() => supabase.from('basket_items').insert(action.payload));
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'UPDATE_BASKET_ITEM':
+                res = await safeCall(() =>
+                    supabase.from('basket_items').update(action.payload.data).eq('id', action.payload.id)
+                );
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'DELETE_BASKET_ITEM':
+                res = await safeCall(() =>
+                    supabase.from('basket_items').delete().eq('id', action.payload.id)
+                );
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'ADD_BASKET_PRICE':
+                res = await safeCall(() =>
+                    supabase.from('basket_price_entries').upsert(action.payload, { onConflict: 'item_id,date' })
+                );
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'ADD_INVESTMENT':
+                res = await safeCall(() => supabase.from('investments').insert(action.payload));
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'UPDATE_INVESTMENT':
+                res = await safeCall(() =>
+                    supabase.from('investments').update(action.payload.data).eq('id', action.payload.id)
+                );
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'DELETE_INVESTMENT':
+                res = await safeCall(() =>
+                    supabase.from('investments').delete().eq('id', action.payload.id)
+                );
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            case 'ADD_INVESTMENT_PRICE':
+                res = await safeCall(() =>
+                    supabase.from('investment_price_entries').upsert(action.payload, { onConflict: 'investment_id,date' })
+                );
+                if (res.error || res.data?.error) throw res.error ?? res.data?.error;
+                break;
+            default:
+                break;
+        }
+    }
+
+    useEffect(() => {
+        const interval = setInterval(async () => {
+            if (session && isOnline) {
+                setIsSyncing(true);
+                try {
+                    await processQueue(runSyncAction);
+                } finally {
+                    setIsSyncing(false);
+                }
+            }
+        }, 5000);
+        return () => clearInterval(interval);
+    }, [session, isOnline]);
+
+    useEffect(() => {
+        if (!session) return;
+
+        const interval = setInterval(() => {
+            if (isOnline) {
+                refreshRemoteData(session.user.id);
+            }
+        }, 60000);
+
+        return () => clearInterval(interval);
+    }, [session, isOnline]);
+
     // --- Persistence (Local Cache) ---
-    useEffect(() => localStorage.setItem('basketItems_v2', JSON.stringify(basketItems)), [basketItems]);
-    useEffect(() => localStorage.setItem('investments_v2', JSON.stringify(investments)), [investments]);
-    useEffect(() => localStorage.setItem('settings_v2', JSON.stringify(settings)), [settings]);
+    useEffect(() => localStorage.setItem(BASKET_KEY, JSON.stringify(basketItems)), [basketItems]);
+    useEffect(() => localStorage.setItem(INVEST_KEY, JSON.stringify(investments)), [investments]);
+    useEffect(() => localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)), [settings]);
 
     // Theme Effect
     useEffect(() => {
@@ -342,55 +563,66 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
     }, [basketItems, investments, settings, isPremium]);
 
     const addBasketItem = async (itemData: Omit<BasketItem, 'id' | 'inflationRate' | 'trend' | 'lastUpdated' | 'history'>) => {
-        const priceInTry = convertToBase(itemData.price);
+        const quantity = 1;
+        if (!isValidQuantity(quantity)) {
+            console.warn('Invalid quantity rejected');
+            return;
+        }
+        if (session) {
+            const { data: row, error } = await supabase
+                .from('basket_items')
+                .insert([{ user_id: session.user.id, name: itemData.name, category: itemData.category }])
+                .select()
+                .single();
+            if (error) {
+                console.error('basket_items insert/delete error', error);
+                enqueue({ type: 'ADD_BASKET_ITEM', payload: { user_id: session.user.id, name: itemData.name, category: itemData.category } });
+                return;
+            }
+            const newItem: BasketItem = {
+                ...mapBasketRowToItem(row),
+                price: itemData.price != null ? convertToBase(itemData.price) : 0,
+                lastUpdated: 'Just now',
+                history: itemData.price != null ? [{ date: new Date().toISOString().split('T')[0], value: convertToBase(itemData.price) }] : []
+            };
+            setBasketItems(prev => [newItem, ...prev]);
+            return;
+        }
+        const priceInTry = convertToBase(itemData.price ?? 0);
         const newItem: BasketItem = {
             ...itemData,
             price: priceInTry,
-            id: crypto.randomUUID(),
+            id: globalThis.crypto.randomUUID(),
             inflationRate: 0,
             trend: 'stable',
             lastUpdated: 'Just now',
-            history: [{ date: new Date().toISOString().split('T')[0], value: priceInTry }]
+            history: itemData.price != null ? [{ date: new Date().toISOString().split('T')[0], value: priceInTry }] : []
         };
-        
-        // Optimistic
         setBasketItems(prev => [newItem, ...prev]);
-
-        // Sync
-        if (session) {
-            try {
-                await supabase.from('basket_items').insert({
-                    id: newItem.id,
-                    user_id: session.user.id,
-                    name: newItem.name,
-                    category: newItem.category,
-                    quantity: 1,
-                    currency: 'TRY'
-                });
-                await supabase.from('basket_price_entries').insert({
-                    item_id: newItem.id,
-                    user_id: session.user.id,
-                    date: newItem.history[0].date,
-                    price: priceInTry,
-                    currency: 'TRY'
-                });
-            } catch(e) { console.error(e); }
-        }
     };
 
-    const updateBasketItem = async (id: string, updates: Partial<BasketItem>) => {
+    const updateBasketItem = async (id: string, updates: Partial<BasketItem> & { is_active?: boolean }) => {
         setBasketItems(prev => prev.map(item => item.id === id ? { ...item, ...updates } : item));
         if (session) {
-             try {
-                await supabase.from('basket_items').update({
-                    name: updates.name,
-                    category: updates.category
-                }).eq('id', id);
-             } catch(e) { console.error(e); }
+            const data: Record<string, unknown> = {};
+            if (updates.name !== undefined) data.name = updates.name;
+            if (updates.category !== undefined) data.category = updates.category;
+            if (updates.is_active !== undefined) data.is_active = updates.is_active;
+            const res = await safeCall(() =>
+                supabase.from('basket_items').update(data).eq('id', id)
+            );
+            const err = res.error ?? (res.data as any)?.error;
+            if (err) {
+                enqueue({ type: 'UPDATE_BASKET_ITEM', payload: { id, data } });
+            }
         }
     };
 
     const addBasketPriceEntry = async (itemId: string, price: number, date: string) => {
+        if (!isValidPrice(price) || !isValidDateISO(date) || !isNotFutureDate(date)) {
+            console.warn('Invalid price entry rejected');
+            return;
+        }
         const priceInTry = convertToBase(price);
         
         // Optimistic
@@ -415,15 +647,20 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
 
         // Sync
         if (session) {
-            try {
-                await supabase.from('basket_price_entries').upsert({
-                    item_id: itemId,
-                    user_id: session.user.id,
-                    date: date,
-                    price: priceInTry,
-                    currency: 'TRY'
-                }, { onConflict: 'item_id,date' });
-            } catch(e) { console.error(e); }
+            const payload = {
+                item_id: itemId,
+                user_id: session.user.id,
+                date: date,
+                price: priceInTry,
+                currency: 'TRY'
+            };
+            const res = await safeCall(() =>
+                supabase.from('basket_price_entries').upsert(payload, { onConflict: 'item_id,date' })
+            );
+            const err = res.error ?? (res.data as any)?.error;
+            if (err) {
+                enqueue({ type: 'ADD_BASKET_PRICE', payload });
+            }
         }
     };
 
@@ -435,16 +672,24 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
     const deleteBasketItem = async (id: string) => {
         setBasketItems(prev => prev.filter(i => i.id !== id));
         if (session) {
-            try { await supabase.from('basket_items').delete().eq('id', id); } catch(e) { console.error(e); }
+            const { error } = await supabase.from('basket_items').delete().eq('id', id);
+            if (error) {
+                console.error('basket_items insert/delete error', error);
+                enqueue({ type: 'DELETE_BASKET_ITEM', payload: { id } });
+            }
         }
     };
 
     const addInvestment = async (invData: Omit<Investment, 'id' | 'dayChangePct' | 'history'>) => {
+        if (!isValidQuantity(invData.quantity)) {
+            console.warn('Invalid investment quantity rejected');
+            return;
+        }
         const priceInTry = convertToBase(invData.currentPrice);
         const newInv: Investment = {
             ...invData,
             currentPrice: priceInTry,
-            id: crypto.randomUUID(),
+            id: globalThis.crypto.randomUUID(),
             dayChangePct: 0,
             history: [{ date: new Date().toISOString().split('T')[0], value: priceInTry }]
         };
@@ -454,43 +699,61 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
 
         // Sync
         if (session) {
-            try {
-                await supabase.from('investments').insert({
-                    id: newInv.id,
-                    user_id: session.user.id,
-                    name: newInv.name,
-                    symbol: newInv.symbol,
-                    type: newInv.type.toLowerCase(), // Store as lowercase in DB
-                    quantity: newInv.quantity,
-                    currency: 'TRY'
-                });
-                await supabase.from('investment_price_entries').insert({
-                    investment_id: newInv.id,
-                    user_id: session.user.id,
-                    date: newInv.history[0].date,
-                    price: priceInTry,
-                    currency: 'TRY'
-                });
-            } catch(e) { console.error(e); }
+            const row = {
+                id: newInv.id,
+                user_id: session.user.id,
+                name: newInv.name,
+                symbol: newInv.symbol,
+                type: newInv.type.toLowerCase(), // Store as lowercase in DB
+                quantity: newInv.quantity,
+                currency: 'TRY'
+            };
+            const insertResult = await safeCall(() => supabase.from('investments').insert(row));
+            const insertErr = insertResult.error ?? (insertResult.data as any)?.error;
+            if (insertErr) {
+                enqueue({ type: 'ADD_INVESTMENT', payload: row });
+                return;
+            }
+            const pricePayload = {
+                investment_id: newInv.id,
+                user_id: session.user.id,
+                date: newInv.history[0].date,
+                price: priceInTry,
+                currency: 'TRY'
+            };
+            const priceResult = await safeCall(() =>
+                supabase.from('investment_price_entries').insert(pricePayload)
+            );
+            const priceErr = priceResult.error ?? (priceResult.data as any)?.error;
+            if (priceErr) {
+                enqueue({ type: 'ADD_INVESTMENT_PRICE', payload: pricePayload });
+            }
         }
     };
 
     const updateInvestment = async (id: string, updates: Partial<Investment>) => {
         setInvestments(prev => prev.map(inv => inv.id === id ? { ...inv, ...updates } : inv));
         if (session) {
-            try {
-                const dbUpdates: any = {};
-                if (updates.name) dbUpdates.name = updates.name;
-                if (updates.symbol) dbUpdates.symbol = updates.symbol;
-                if (updates.quantity) dbUpdates.quantity = updates.quantity;
-                if (updates.type) dbUpdates.type = updates.type.toLowerCase();
-
-                await supabase.from('investments').update(dbUpdates).eq('id', id);
-            } catch(e) { console.error(e); }
+            const dbUpdates: any = {};
+            if (updates.name) dbUpdates.name = updates.name;
+            if (updates.symbol) dbUpdates.symbol = updates.symbol;
+            if (updates.quantity) dbUpdates.quantity = updates.quantity;
+            if (updates.type) dbUpdates.type = updates.type.toLowerCase();
+            const res = await safeCall(() =>
+                supabase.from('investments').update(dbUpdates).eq('id', id)
+            );
+            const err = res.error ?? (res.data as any)?.error;
+            if (err) {
+                enqueue({ type: 'UPDATE_INVESTMENT', payload: { id, data: dbUpdates } });
+            }
         }
     };
 
     const addInvestmentPriceEntry = async (itemId: string, price: number, date: string) => {
+        if (!isValidPrice(price) || !isValidDateISO(date) || !isNotFutureDate(date)) {
+            console.warn('Invalid price entry rejected');
+            return;
+        }
         const priceInTry = convertToBase(price);
         
         // Optimistic
@@ -503,34 +766,45 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
 
         // Sync
         if (session) {
-            try {
-                await supabase.from('investment_price_entries').upsert({
-                    investment_id: itemId,
-                    user_id: session.user.id,
-                    date: date,
-                    price: priceInTry,
-                    currency: 'TRY'
-                }, { onConflict: 'investment_id,date' });
-            } catch(e) { console.error(e); }
+            const payload = {
+                investment_id: itemId,
+                user_id: session.user.id,
+                date: date,
+                price: priceInTry,
+                currency: 'TRY'
+            };
+            const res = await safeCall(() =>
+                supabase.from('investment_price_entries').upsert(payload, { onConflict: 'investment_id,date' })
+            );
+            const err = res.error ?? (res.data as any)?.error;
+            if (err) {
+                enqueue({ type: 'ADD_INVESTMENT_PRICE', payload });
+            }
         }
     };
 
     const deleteInvestment = async (id: string) => {
         setInvestments(prev => prev.filter(i => i.id !== id));
         if (session) {
-            try { await supabase.from('investments').delete().eq('id', id); } catch(e) { console.error(e); }
+            const res = await safeCall(() =>
+                supabase.from('investments').delete().eq('id', id)
+            );
+            const err = res.error ?? (res.data as any)?.error;
+            if (err) {
+                enqueue({ type: 'DELETE_INVESTMENT', payload: { id } });
+            }
         }
     };
 
     const updateSettings = async (s: Partial<UserSettings>) => {
         setSettings(prev => ({ ...prev, ...s }));
         if (session && s.currency) {
-            try {
-                await supabase.from('user_settings').upsert({
+            await safeCall(() =>
+                supabase.from('user_settings').upsert({
                     user_id: session.user.id,
                     currency: s.currency
-                });
-            } catch(e) { console.error(e); }
+                })
+            );
         }
     };
 
@@ -539,6 +813,10 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
             session,
             authLoading,
             authError,
+            isInitializing,
+            isOnline,
+            isSyncing,
+            lastRemoteSyncISO,
             isPremium,
             entitlementLoading,
             purchasePremium,
@@ -563,7 +841,8 @@ export const AppProvider = ({ children }: { children?: ReactNode }) => {
             updateInvestment,
             addInvestmentPriceEntry,
             deleteInvestment, 
-            updateSettings 
+            updateSettings,
+            refetchBasket 
         }}>
             {children}
         </AppContext.Provider>
